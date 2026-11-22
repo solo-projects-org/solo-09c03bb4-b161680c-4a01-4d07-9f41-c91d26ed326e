@@ -1,0 +1,18 @@
+name: road-noise
+
+services:
+  api:
+    build: .
+    image: road-noise-api:1.0.0
+    container_name: road-noise-api
+    environment:
+      NOISE_DB: /data/noise.db
+      NOISE_STATION: ${NOISE_STATION:-station-01}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - noise-data:/data
+    restart: unless-stopped
+
+volumes:
+  noise-data:
