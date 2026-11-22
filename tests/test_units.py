@@ -184,3 +184,33 @@ def test_edge_equal_to_original_edge_puts_bin_in_higher_band():
     assert service.counts_from_intervals(intervals, [55]) == [100, 1340]
     assert service.counts_from_intervals(intervals, [65]) == [600, 840]
     assert service.counts_from_intervals(intervals, [55, 65]) == [100, 500, 840]
+
+
+def test_fingerprint_depends_on_source_and_complete_content():
+    a = service.normalize_minutes([50] * 1440)
+    same = service.normalize_minutes([50] * 1440)
+    different = service.normalize_minutes([50] * 1439 + [51])
+    assert service.fingerprint_normalized(a) == service.fingerprint_normalized(same)
+    assert service.fingerprint_normalized(a) != service.fingerprint_normalized(different)
+
+    # Same distribution via a different source is a different day.
+    as_bins = service.normalize_intervals(
+        service.intervals_from_boundaries([50], [0, 1440])
+    )
+    assert service.fingerprint_normalized(a) != service.fingerprint_normalized(as_bins)
+
+
+def test_fingerprint_same_for_equivalent_bins_spellings():
+    via_edges = service.normalize_intervals(
+        service.intervals_from_boundaries([55, 65], [210, 690, 540])
+    )
+    via_intervals = service.normalize_intervals(
+        [
+            service.Interval(None, 55, 210),
+            service.Interval(55, 65, 690),
+            service.Interval(65, None, 540),
+        ]
+    )
+    assert service.fingerprint_normalized(via_edges) == service.fingerprint_normalized(
+        via_intervals
+    )

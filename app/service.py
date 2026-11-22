@@ -19,6 +19,7 @@ transactions are opened here at the granularity of one operation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -231,54 +232,138 @@ def intervals_from_boundaries(boundaries: list[int], counts: list[int]) -> list[
 # Day storage
 # ---------------------------------------------------------------------------
 
+FINGERPRINT_SCHEME = "v1"
+
+
+def _fingerprint(
+    source: str,
+    values: Iterable[int] | None,
+    intervals: Iterable[Interval] | None,
+) -> str:
+    """Content hash of one day: source plus the complete content.
+
+    The canonical JSON covers everything downstream considers "the same
+    day", so two submissions are interchangeable exactly when their
+    fingerprints match.  Equivalent spellings of a bins-day (explicit
+    intervals vs. boundaries+counts) normalise to the same intervals and
+    therefore share one fingerprint.
+    """
+    if source == "minutes":
+        body: dict[str, Any] = {"source": "minutes", "values": list(values or ())}
+    else:
+        body = {
+            "source": "bins",
+            "intervals": [b.to_json() for b in intervals or ()],
+        }
+    canonical = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{FINGERPRINT_SCHEME}:{digest}"
+
+
+def fingerprint_normalized(norm: NormalizedDay) -> str:
+    return _fingerprint(norm.source, norm.values, norm.intervals)
+
+
+def _fingerprint_stored(conn: sqlite3.Connection, day_id: int, source: str) -> str:
+    """Fingerprint of an existing row, derived from its actual content.
+
+    Rows written before schema v2 have no stored fingerprint; their first
+    comparison must be against what is really in ``reading``/``bin_interval``,
+    so the hash is computed from those rows (the caller then backfills it).
+    """
+    if source == "minutes":
+        values = [
+            int(r["value"])
+            for r in conn.execute(
+                "SELECT value FROM reading WHERE day_id = ? ORDER BY minute",
+                (day_id,),
+            )
+        ]
+        return _fingerprint("minutes", values, None)
+    return _fingerprint("bins", None, _load_intervals(conn, day_id))
+
+
+def _insert_details(conn: sqlite3.Connection, day_id: int, norm: NormalizedDay) -> None:
+    if norm.source == "minutes":
+        conn.executemany(
+            "INSERT INTO reading (day_id, minute, value) VALUES (?, ?, ?)",
+            [(day_id, i, v) for i, v in enumerate(norm.values or ())],
+        )
+    else:
+        conn.executemany(
+            "INSERT INTO bin_interval (day_id, idx, lower, upper, minutes)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [
+                (day_id, i, b.lower, b.upper, b.minutes)
+                for i, b in enumerate(norm.intervals or ())
+            ],
+        )
+
 
 def upsert_day(conn: sqlite3.Connection, day: date, norm: NormalizedDay) -> dict:
-    """Replace the whole day atomically and bump its revision."""
+    """Store one day, deduplicating exact re-submissions.
+
+    The comparison and the write share one immediate transaction, so
+    concurrent submissions serialise and the outcome matches commit order:
+
+    * same source and complete content -> the stored revision is returned
+      unchanged and nothing is rewritten (``deduplicated: true``);
+    * changed content or source -> the day is atomically replaced and its
+      revision bumped, all-or-nothing, never half a day.
+    """
     day_iso = iso(day)
     now = utcnow()
+    new_fp = fingerprint_normalized(norm)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT day_id, revision FROM day WHERE date = ?", (day_iso,)
+            "SELECT day_id, revision, source, updated_at, fingerprint FROM day"
+            " WHERE date = ?",
+            (day_iso,),
         ).fetchone()
-        if row is None:
-            cur = conn.execute(
-                "INSERT INTO day (date, revision, source, created_at, updated_at)"
-                " VALUES (?, 1, ?, ?, ?)",
-                (day_iso, norm.source, now, now),
-            )
-            day_id = int(cur.lastrowid)
-            revision = 1
-        else:
+        if row is not None:
             day_id = int(row["day_id"])
+            stored_fp = row["fingerprint"]
+            if stored_fp is None:
+                # Pre-v2 row without a fingerprint: compare against the actual
+                # stored content, then backfill so later checks are cheap.
+                stored_fp = _fingerprint_stored(conn, day_id, row["source"])
+                conn.execute(
+                    "UPDATE day SET fingerprint = ? WHERE day_id = ?",
+                    (stored_fp, day_id),
+                )
+            if stored_fp == new_fp:
+                return {
+                    "date": day_iso,
+                    "revision": int(row["revision"]),
+                    "source": row["source"],
+                    "minutes_total": MINUTES_PER_DAY,
+                    "updated_at": row["updated_at"],
+                    "deduplicated": True,
+                }
             revision = int(row["revision"]) + 1
             conn.execute(
-                "UPDATE day SET revision = ?, source = ?, updated_at = ?"
-                " WHERE day_id = ?",
-                (revision, norm.source, now, day_id),
+                "UPDATE day SET revision = ?, source = ?, fingerprint = ?,"
+                " updated_at = ? WHERE day_id = ?",
+                (revision, norm.source, new_fp, now, day_id),
             )
             conn.execute("DELETE FROM reading WHERE day_id = ?", (day_id,))
             conn.execute("DELETE FROM bin_interval WHERE day_id = ?", (day_id,))
-
-        if norm.source == "minutes":
-            conn.executemany(
-                "INSERT INTO reading (day_id, minute, value) VALUES (?, ?, ?)",
-                [(day_id, i, v) for i, v in enumerate(norm.values or ())],
-            )
         else:
-            conn.executemany(
-                "INSERT INTO bin_interval (day_id, idx, lower, upper, minutes)"
-                " VALUES (?, ?, ?, ?, ?)",
-                [
-                    (day_id, i, b.lower, b.upper, b.minutes)
-                    for i, b in enumerate(norm.intervals or ())
-                ],
+            cur = conn.execute(
+                "INSERT INTO day (date, revision, source, fingerprint,"
+                " created_at, updated_at) VALUES (?, 1, ?, ?, ?, ?)",
+                (day_iso, norm.source, new_fp, now, now),
             )
+            day_id = int(cur.lastrowid)
+            revision = 1
+        _insert_details(conn, day_id, norm)
     return {
         "date": day_iso,
         "revision": revision,
         "source": norm.source,
         "minutes_total": MINUTES_PER_DAY,
         "updated_at": now,
+        "deduplicated": False,
     }
 
 

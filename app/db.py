@@ -10,6 +10,12 @@ Query snapshots are materialised: ``query_log`` holds the boundaries and the
 rejection report, ``query_day`` the per-day counts, and ``query_page`` the
 frozen page layout.  That is what makes paging resumable across corrections,
 late submissions and restarts.
+
+Schema v2 adds ``day.fingerprint``: a content hash of the source plus the
+complete stored day, used to deduplicate identical re-submissions without
+rewriting the day.  Rows written before v2 carry NULL; their first
+comparison recomputes the hash from the actual readings/bins and backfills
+it (see ``service.upsert_day``).
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS day (
@@ -27,6 +33,7 @@ CREATE TABLE IF NOT EXISTS day (
     date        TEXT NOT NULL UNIQUE,        -- ISO date, sortable as text
     revision    INTEGER NOT NULL,
     source      TEXT NOT NULL,               -- 'minutes' | 'bins'
+    fingerprint TEXT,                        -- content hash; NULL on pre-v2 rows
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -116,6 +123,14 @@ def init_db(path: Path | str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        # Migrate pre-v2 databases: the fingerprint column is added to the
+        # existing day rows as NULL, so their first comparison falls back to
+        # the actual stored content.  CREATE TABLE IF NOT EXISTS above already
+        # covers fresh databases; check the live table instead of trusting
+        # user_version alone.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(day)")}
+        if "fingerprint" not in columns:
+            conn.execute("ALTER TABLE day ADD COLUMN fingerprint TEXT")
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     finally:
         conn.close()

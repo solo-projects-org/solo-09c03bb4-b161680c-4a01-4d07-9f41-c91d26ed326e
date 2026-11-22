@@ -130,9 +130,22 @@ class DayWriteOut(BaseModel):
     source: Literal["minutes", "bins"]
     minutes_total: int
     updated_at: str
+    deduplicated: bool = Field(
+        description=(
+            "true when the same source and complete content were already "
+            "stored: nothing was rewritten and the stored revision is "
+            "returned unchanged"
+        )
+    )
 
 
-class DayOut(DayWriteOut):
+class DayOut(BaseModel):
+    station: str
+    date: str
+    revision: int
+    source: Literal["minutes", "bins"]
+    minutes_total: int
+    updated_at: str
     values: list[int] | None
     intervals: list[BinIntervalOut] | None
 

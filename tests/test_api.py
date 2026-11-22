@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
+import threading
+from datetime import date
+
 from .conftest import minutes
 
 
@@ -252,3 +256,297 @@ def test_unknown_query_and_page(client):
     ).json()
     assert client.get(f"/queries/{created['query_id']}/pages/2").status_code == 404
     assert client.get(f"/queries/{created['query_id']}/pages/0").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Deduplication of identical re-submissions
+# ---------------------------------------------------------------------------
+
+
+def test_identical_resubmission_returns_stored_revision_untouched(client):
+    values = minutes(l50=600, l62=600, l70=240)
+    first = client.put("/days/2024-01-10", json={"mode": "minutes", "values": values})
+    assert first.status_code == 200
+    assert first.json()["revision"] == 1
+    assert first.json()["deduplicated"] is False
+
+    again = client.put("/days/2024-01-10", json={"mode": "minutes", "values": values})
+    assert again.status_code == 200
+    body = again.json()
+    assert body["deduplicated"] is True
+    assert body["revision"] == 1
+    # Nothing was rewritten: the stored timestamps and content are untouched.
+    assert body["updated_at"] == first.json()["updated_at"]
+
+    stored = client.get("/days/2024-01-10").json()
+    assert stored["revision"] == 1
+    assert stored["updated_at"] == first.json()["updated_at"]
+    assert stored["values"] == values
+
+
+def test_identical_bins_resubmission_across_representations(client):
+    client.put("/days/2024-01-11", json=_bins([55, 65], [210, 690, 540]))
+    again = client.put(
+        "/days/2024-01-11",
+        json={
+            "mode": "bins",
+            "intervals": [
+                {"lower": None, "upper": 55, "minutes": 210},
+                {"lower": 55, "upper": 65, "minutes": 690},
+                {"lower": 65, "upper": None, "minutes": 540},
+            ],
+        },
+    )
+    assert again.json()["revision"] == 1
+    assert again.json()["deduplicated"] is True
+    stored = client.get("/days/2024-01-11").json()
+    assert stored["revision"] == 1
+
+
+def test_same_distribution_different_source_is_a_correction(client):
+    client.put("/days/2024-01-12", json={"mode": "minutes", "values": minutes(l50=1440)})
+    # Same distribution, different source: not a duplicate, revision bumps.
+    rewritten = client.put("/days/2024-01-12", json=_bins([50], [0, 1440]))
+    assert rewritten.json()["revision"] == 2
+    assert rewritten.json()["deduplicated"] is False
+
+
+def test_dedup_then_real_correction_bumps_only_once(client):
+    client.put("/days/2024-01-13", json={"mode": "minutes", "values": minutes(l50=1440)})
+    dup = client.put("/days/2024-01-13", json={"mode": "minutes", "values": minutes(l50=1440)})
+    assert dup.json()["revision"] == 1
+    assert dup.json()["deduplicated"] is True
+
+    correction = client.put(
+        "/days/2024-01-13", json={"mode": "minutes", "values": minutes(l60=1440)}
+    )
+    assert correction.json()["revision"] == 2
+    assert correction.json()["deduplicated"] is False
+
+    # Re-sending the corrected content is deduplicated against revision 2.
+    again = client.put(
+        "/days/2024-01-13", json={"mode": "minutes", "values": minutes(l60=1440)}
+    )
+    assert again.json()["revision"] == 2
+    assert again.json()["deduplicated"] is True
+
+
+def test_dedup_does_not_create_phantom_correction_for_queries(client):
+    client.put(
+        "/days/2024-01-14", json={"mode": "minutes", "values": minutes(l50=1000, l70=440)}
+    )
+    dup = client.put(
+        "/days/2024-01-14", json={"mode": "minutes", "values": minutes(l50=1000, l70=440)}
+    )
+    assert dup.json()["deduplicated"] is True
+    # A query created after the duplicate still pins revision 1.
+    created = client.post(
+        "/queries",
+        json={"start_date": "2024-01-14", "end_date": "2024-01-14", "boundaries": [60]},
+    ).json()
+    page = client.get(f"/queries/{created['query_id']}/pages/1").json()
+    assert page["days"][0]["revision"] == 1
+    assert page["days"][0]["counts"] == [1000, 440]
+
+
+def test_failed_correction_leaves_stored_day_untouched(client):
+    client.put("/days/2024-01-15", json={"mode": "minutes", "values": minutes(l50=1440)})
+    bad = client.put("/days/2024-01-15", json=_bins([60], [100, 100]))
+    assert bad.status_code == 422
+    stored = client.get("/days/2024-01-15").json()
+    assert stored["revision"] == 1
+    assert stored["source"] == "minutes"
+    assert stored["values"] == minutes(l50=1440)
+
+
+# ---------------------------------------------------------------------------
+# Legacy databases without fingerprints
+# ---------------------------------------------------------------------------
+
+# The schema exactly as a v1 database has it: no day.fingerprint column.
+_V1_SCHEMA = """
+CREATE TABLE day (
+    day_id      INTEGER PRIMARY KEY,
+    date        TEXT NOT NULL UNIQUE,
+    revision    INTEGER NOT NULL,
+    source      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE TABLE reading (
+    day_id  INTEGER NOT NULL REFERENCES day(day_id) ON DELETE CASCADE,
+    minute  INTEGER NOT NULL CHECK (minute BETWEEN 0 AND 1439),
+    value   INTEGER NOT NULL,
+    PRIMARY KEY (day_id, minute)
+) WITHOUT ROWID;
+CREATE TABLE bin_interval (
+    day_id     INTEGER NOT NULL REFERENCES day(day_id) ON DELETE CASCADE,
+    idx        INTEGER NOT NULL,
+    lower      INTEGER,
+    upper      INTEGER,
+    minutes    INTEGER NOT NULL CHECK (minutes >= 0),
+    PRIMARY KEY (day_id, idx)
+) WITHOUT ROWID;
+"""
+
+
+def _seed_v1_db(path) -> None:
+    """A v1 database holding one minutes-day at revision 3, no fingerprints."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_V1_SCHEMA)
+        conn.execute("PRAGMA user_version=1")
+        conn.execute(
+            "INSERT INTO day (date, revision, source, created_at, updated_at)"
+            " VALUES ('2024-02-01', 3, 'minutes',"
+            " '2024-02-02T00:00:00+00:00', '2024-02-02T00:00:00+00:00')"
+        )
+        conn.executemany(
+            "INSERT INTO reading (day_id, minute, value) VALUES (1, ?, ?)",
+            [(i, 55) for i in range(1440)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_legacy_db_dedups_against_actual_stored_content(tmp_path, monkeypatch):
+    import importlib
+    import sys
+
+    from fastapi.testclient import TestClient
+
+    db_file = tmp_path / "noise.db"
+    _seed_v1_db(db_file)
+    monkeypatch.setenv("NOISE_DB", str(db_file))
+    if "app.main" in sys.modules:
+        module = importlib.reload(sys.modules["app.main"])
+    else:
+        module = importlib.import_module("app.main")
+
+    with TestClient(module.app) as client:
+        # Startup migrated the schema in place.
+        assert client.get("/health").json()["schema_version"] == 2
+
+        # First comparison for the legacy row uses the actual stored readings.
+        dup = client.put(
+            "/days/2024-02-01", json={"mode": "minutes", "values": [55] * 1440}
+        )
+        assert dup.status_code == 200
+        assert dup.json()["deduplicated"] is True
+        assert dup.json()["revision"] == 3
+        assert dup.json()["updated_at"] == "2024-02-02T00:00:00+00:00"
+
+        # The fingerprint was backfilled on the legacy row.
+        conn = sqlite3.connect(db_file)
+        try:
+            row = conn.execute(
+                "SELECT fingerprint, revision FROM day WHERE date = '2024-02-01'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0]
+        assert row[1] == 3
+
+        # A real change still replaces atomically and bumps the revision.
+        correction = client.put(
+            "/days/2024-02-01", json={"mode": "minutes", "values": [60] * 1440}
+        )
+        assert correction.json()["revision"] == 4
+        assert correction.json()["deduplicated"] is False
+        stored = client.get("/days/2024-02-01").json()
+        assert stored["values"] == [60] * 1440
+
+
+# ---------------------------------------------------------------------------
+# Concurrent duplicates and corrections
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_identical_first_submissions_commit_once(tmp_path):
+    from app import db, service
+
+    path = tmp_path / "noise.db"
+    db.init_db(path)
+    norm = service.normalize_minutes([55] * 1440)
+    results = []
+
+    def worker():
+        conn = db.connect(path)
+        try:
+            results.append(service.upsert_day(conn, date(2024, 3, 1), norm))
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Exactly one insert wins; everyone else deduplicates against it.
+    assert len(results) == 6
+    assert all(r["revision"] == 1 for r in results)
+    assert sum(1 for r in results if not r["deduplicated"]) == 1
+
+    conn = db.connect(path)
+    try:
+        stored = service.day_payload(conn, date(2024, 3, 1), "test")
+    finally:
+        conn.close()
+    assert stored["revision"] == 1
+    assert stored["values"] == [55] * 1440
+
+
+def test_concurrent_duplicate_and_correction_match_commit_order(tmp_path):
+    from app import db, service
+
+    path = tmp_path / "noise.db"
+    db.init_db(path)
+    day = date(2024, 3, 2)
+    norm_a = service.normalize_minutes([50] * 1440)
+    norm_b = service.normalize_minutes([60] * 1440)
+
+    conn = db.connect(path)
+    try:
+        assert service.upsert_day(conn, day, norm_a)["revision"] == 1
+    finally:
+        conn.close()
+
+    results: list[tuple[str, dict]] = []
+    lock = threading.Lock()
+
+    def worker(tag, norm):
+        conn = db.connect(path)
+        try:
+            outcome = service.upsert_day(conn, day, norm)
+            with lock:
+                results.append((tag, outcome))
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=worker, args=(tag, norm))
+        for tag, norm in [("a", norm_a), ("b", norm_b), ("a", norm_a), ("b", norm_b), ("a", norm_a)]
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 5
+    # Writes serialised: the bumped revisions are exactly 2..N, no gaps.
+    writes = sorted(
+        (r["revision"], tag) for tag, r in results if not r["deduplicated"]
+    )
+    assert [rev for rev, _ in writes] == list(range(2, 2 + len(writes)))
+
+    # The last committed write wins and the stored day is complete, never half.
+    final_revision, last_tag = writes[-1]
+    conn = db.connect(path)
+    try:
+        stored = service.day_payload(conn, day, "test")
+    finally:
+        conn.close()
+    assert stored["revision"] == final_revision
+    assert stored["values"] == ([50] * 1440 if last_tag == "a" else [60] * 1440)

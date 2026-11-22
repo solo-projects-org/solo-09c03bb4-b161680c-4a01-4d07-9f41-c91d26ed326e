@@ -5,6 +5,8 @@
 
 - 某候选边界若会切开范围内任一天非空的历史分档，则**丢弃该边界**，并回报该日与它的原档。
 - 用**余下的边界**统计：档位是 `[lower, upper)`，等于边界的读数归**较高档**。
+- **重复上报去重**：同一日期以相同来源、相同完整内容重复 PUT 时，直接返回原修订号，
+  不重写日档（响应 `deduplicated: true`）；内容或来源有变化才原子替换并升修订。
 - 查询一旦建立就**冻结**：边界、各日计数、每页日期全部落库。之后补报、更正、重启都不改变旧查询；
   凭 `query_id` 逐页续取，跨重启一致。
 - 新查询每次读取当时的最新数据。
@@ -30,7 +32,7 @@ API_PORT=9000 NOISE_STATION=ring-road-north docker compose up --build -d
 
 | 表 | 作用 |
 | --- | --- |
-| `day` | 每天一行：日期、修订号、来源（`minutes`/`bins`） |
+| `day` | 每天一行：日期、修订号、来源（`minutes`/`bins`）、内容指纹 `fingerprint` |
 | `reading` | 逐分钟读数日的 1440 行整数 |
 | `bin_interval` | 分档日的原档（半开区间，`NULL` 表示无界）与分钟数 |
 | `query_log` | 查询快照：请求/生效边界、被拒边界及证据、缺失日期、分页大小 |
@@ -38,6 +40,10 @@ API_PORT=9000 NOISE_STATION=ring-road-north docker compose up --build -d
 | `query_page` | 冻结的每页日期列表 |
 
 所有写入都在一个 `BEGIN IMMEDIATE` 事务内完成，整天替换要么全成、要么全不成。
+
+`fingerprint` 是“来源 + 完整内容”的 SHA-256（schema v2 新增，启动时自动迁移旧库）。
+重复上报判定在写入事务内完成：指纹一致即原样返回，不一致才替换。v1 旧行没有指纹，
+首次比较时从实际存储的 `reading`/`bin_interval` 现算并回填，因此旧库无需任何手工迁移。
 
 ## 接口
 
@@ -63,7 +69,13 @@ curl -X PUT http://127.0.0.1:8000/days/2024-06-02 \
   -d '{"mode":"bins","boundaries":[55,65],"counts":[210,690,540]}'
 ```
 
-同一日期再次 PUT 即**整天更正**，`revision` 加一（来源也可以换，例如先报分钟再更正为分档）。
+同一日期再次 PUT 的语义：
+
+- **内容、来源都相同**（采集程序重复上报）：直接返回原修订号，响应 `deduplicated: true`，
+  `revision` 与 `updated_at` 不变，日档一行不重写，下游不会把重复上报误当成更正。
+  分档日的两种写法（显式 `intervals` 与 `boundaries`+`counts`）规范化后等价，同样去重。
+- **内容或来源有变化**（真实更正）：整天原子替换，`revision` 加一，`deduplicated: false`
+  （来源也可以换，例如先报分钟再更正为分档）。
 
 `GET /days/{date}` 取回最新版本；`GET /days?start_date=&end_date=` 列出区间内已存日期。
 
@@ -118,8 +130,16 @@ curl "http://127.0.0.1:8000/queries/q-…"                    # 元数据 + 页�
 ### 冻结语义
 
 - 旧 `query_id` 的响应只会返回建查询时的边界与计数；`revision` 字段标明当时钉住的是哪一版。
+- 重复上报被去重后不产生新修订，因此新旧查询都不会看到“幽灵更正”。
 - 出错处理不会写快照（整天替换也是单事务）。
 - 所有查询状态都在 SQLite 中，服务重启后凭 `query_id` 继续翻页，结果逐字节一致。
+
+### 并发与一致性
+
+- 每个 PUT 的“比对指纹 + 写入”都在同一个 `BEGIN IMMEDIATE` 事务内，写请求彼此串行：
+  重复上报与真实更正并发时，最终修订号与内容按提交先后确定，后到者基于先到者的结果判定。
+- 任何一步失败都会回滚整个事务，不会留下半套日档（例如只有 `day` 行没有明细）。
+- 读（查询、翻页）走 WAL 快照，不被写入阻塞。
 
 ### 错误格式
 
@@ -144,8 +164,26 @@ uvicorn app.main:app --port 8000          # NOISE_DB 默认 ./data/noise.db，�
 python scripts/demo.py http://127.0.0.1:8000
 ```
 
-`scripts/demo.py` 只用标准库，演示：分钟日 + 分档日 → 边界审查 → 两页取数 → 更正一天 →
-旧查询保持不变、新查询看到更正。
+`scripts/demo.py` 只用标准库，演示：分钟日 + 分档日 → 重复上报去重 → 边界审查 → 两页取数 →
+更正一天 → 旧查询保持不变、新查询看到更正。
+
+## Swagger 演示流程（重复上报 / 真实更正 / 重启 / 旧查询回查）
+
+`docker compose up --build -d` 后打开 http://127.0.0.1:8000/docs ，按顺序操作：
+
+1. **重复上报**：`PUT /days/2024-06-01`，body 用
+   `{"mode":"bins","boundaries":[65],"counts":[600,840]}`，连点两次 Execute。
+   第一次返回 `"revision": 1, "deduplicated": false`；第二次返回
+   `"revision": 1, "deduplicated": true`，`updated_at` 不变——日档未被重写。
+2. **真实更正**：同一日期改 body 为 `{"mode":"bins","boundaries":[65],"counts":[500,940]}`，
+   返回 `"revision": 2, "deduplicated": false`。`GET /days/2024-06-01` 可见新内容、修订 2。
+3. **建查询**：`POST /queries`，body
+   `{"start_date":"2024-06-01","end_date":"2024-06-01","boundaries":[60,65],"page_size":31}`，
+   记下 `query_id`；`GET /queries/{query_id}/pages/1` 看到钉住的是 `revision: 2`。
+4. **重启**：`docker compose restart`，等 `/health` 恢复。
+5. **旧查询回查**：再次 `GET /queries/{query_id}/pages/1`，计数与修订号与重启前逐字节一致；
+   `GET /days/2024-06-01` 仍是修订 2（数据在命名卷 `noise-data` 中）。
+6. 再发一次第 2 步的更正 body，返回 `deduplicated: true`——重启后指纹依然生效。
 
 ## 边界与限制
 

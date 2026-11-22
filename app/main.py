@@ -2,7 +2,7 @@
 
 Endpoints
 ---------
-``PUT  /days/{date}``                    submit or fully replace one day
+``PUT  /days/{date}``                    submit one day (identical re-sends deduplicated)
 ``GET  /days/{date}``                    read the stored day as submitted
 ``GET  /days?start_date=&end_date=``     list stored days in a range
 ``POST /queries``                        vet edges, freeze a query
@@ -134,12 +134,14 @@ def health(conn: Conn) -> HealthOut:
     "/days/{day}",
     response_model=DayWriteOut,
     tags=["days"],
-    summary="Submit or fully replace one day",
+    summary="Submit one day; identical re-submissions are deduplicated",
     description=(
         "Body is either ``{mode: 'minutes', values: [...]}`` (1440 integers) "
         "or ``{mode: 'bins', ...}`` with either explicit ``intervals`` or "
-        "``boundaries`` + ``counts``. A repeated PUT fully replaces the day "
-        "and increases its revision."
+        "``boundaries`` + ``counts``. Re-submitting the same source and "
+        "complete content returns the stored revision unchanged and rewrites "
+        "nothing (``deduplicated: true``); a change of content or source "
+        "atomically replaces the whole day and increases its revision."
     ),
 )
 def put_day(

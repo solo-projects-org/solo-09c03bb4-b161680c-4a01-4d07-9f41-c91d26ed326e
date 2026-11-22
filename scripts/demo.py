@@ -8,10 +8,11 @@ Defaults to http://127.0.0.1:8000.  Requires only the standard library.
 Scenarios
 ---------
 1. A day of per-minute readings and a day of original-bin counts.
-2. Create a query whose candidate edges get vetted: edges that split an
+2. Re-send the identical day: it is deduplicated (same revision, no rewrite).
+3. Create a query whose candidate edges get vetted: edges that split an
    original bin are dropped and reported with the offending day and bin.
-3. Page through the frozen result, resuming page by page.
-4. Correct a day, show the old query still serves its frozen numbers and a
+4. Page through the frozen result, resuming page by page.
+5. Correct a day, show the old query still serves its frozen numbers and a
    new query picks up the correction.
 """
 
@@ -82,6 +83,18 @@ def main() -> int:
     )
     print(f"PUT 2024-06-01 (bins):    {status} rev={written.get('revision')}")
 
+    # Collectors often re-send the same archive: the identical re-submission
+    # is deduplicated — same revision, nothing rewritten.
+    status, dup = call(
+        "PUT",
+        "/days/2024-06-01",
+        {"mode": "bins", "boundaries": [65], "counts": [600, 840]},
+    )
+    print(
+        f"PUT 2024-06-01 (repeat):  {status} rev={dup.get('revision')} "
+        f"deduplicated={dup.get('deduplicated')} updated_at={dup.get('updated_at')}"
+    )
+
     request = {
         "start_date": "2023-06-01",
         "end_date": "2024-06-01",
@@ -129,7 +142,10 @@ def main() -> int:
     status, written = call(
         "PUT", "/days/2024-06-01", {"mode": "minutes", "values": corrected}
     )
-    print(f"\nPUT 2024-06-01 correction: {status} rev={written.get('revision')}")
+    print(
+        f"\nPUT 2024-06-01 correction: {status} rev={written.get('revision')} "
+        f"deduplicated={written.get('deduplicated')}"
+    )
 
     status, page = call("GET", f"/queries/{query_id}/pages/{query['pages_total']}")
     print(f"\n== old query {query_id[:10]}... after correction (unchanged) ==")
